@@ -1,0 +1,249 @@
+//@version=5
+indicator("NXS PREMIUM SCANNER (35-Call Magazine)", shorttitle="NXS SCANNER", overlay=true)
+
+//══════════════════════════════════════════════════════════════════════════════
+// BLOCK 1: FRONT-END MAGAZINE LOADER & SWEET-SPOT SETTINGS
+//══════════════════════════════════════════════════════════════════════════════
+grp_mag = "1. Pre-Market Magazine Loader (Auto-Chain)"
+opt_exch     = input.string("OPRA", "Options Exchange Prefix", options=["OPRA", "CBOE", "BATS", "NYSE", "NASDAQ", "AMEX"], group=grp_mag)
+opt_root     = input.string("QQQ", "Option Root Ticker", options=["QQQ", "SPY", "SPX", "SPXW", "NDX", "IWM", "SMH", "TSLA", "NVDA", "AAPL"], group=grp_mag)
+custom_root  = input.string("", "Custom Root Override (Optional - Use CAPS)", group=grp_mag)
+
+exp_code     = input.string("261117", "0DTE Expiration Date (YYMMDD)", group=grp_mag)
+anchor_strk  = input.float(662.0, "Pre-Market Anchor Strike (Center of 35-Call Ladder)", step=1.0, group=grp_mag)
+strk_step    = input.float(1.0, "Strike Step Increment ($1 = QQQ/SPY, $5 = SPX)", step=0.5, group=grp_mag)
+strk_format  = input.string("Auto (.0 for Whole Numbers)", "Ticker Strike Formatting", options=["Auto (.0 for Whole Numbers)", "Integer Only (No .0)", "Exact Decimal"], group=grp_mag)
+
+grp_zone = "2. Target Premium Chamber ($400 - $450 Sweet Spot)"
+prem_floor   = input.float(4.00, "Target Premium Floor ($4.00 = $400)", step=0.10, group=grp_zone)
+prem_ceil    = input.float(4.50, "Target Premium Ceiling ($4.50 = $450)", step=0.10, group=grp_zone)
+prem_ideal   = input.float(4.25, "Ideal Bullseye Premium ($4.25 = $425)", step=0.05, group=grp_zone)
+
+grp_hud = "3. HUD Architecture & Orientation"
+hud_style    = input.string("Vertical Stack (1-Column Slim)", "HUD Orientation & Style", options=["Vertical Stack (1-Column Slim)", "Horizontal Tape (Bottom/Top Bar)", "Classic 3-Column Table"], group=grp_hud, tooltip="Vertical Stack = Razor-thin 1-column strip. Horizontal Tape = Flat bar across top/bottom. Classic = 3-column table.")
+hud_mode     = input.string("Single Bullseye (1-Strike Only)", "Strike Scope (Modular Filter)", options=["Single Bullseye (1-Strike Only)", "In-Zone Only ($400-$450 Filter)", "Sniper Pill (3-Strike Compact)", "Full Strike Ladder"], group=grp_hud, tooltip="Single Bullseye = Shows ONLY the 1 main middle contract. In-Zone Only = Shows only strikes inside $400-$450. Sniper Pill = Main + 1 above/below. Full Ladder = Uses radius below.")
+ladder_rad   = input.int(5, "Full Ladder: Strikes Above/Below Best Match", minval=0, maxval=17, group=grp_hud)
+show_hdr     = input.bool(false, "Show HUD Header Cell", group=grp_hud, tooltip="Uncheck for a pure 1-cell badge when using Single Bullseye mode.")
+price_fmt    = input.string("Total Dollars ($420)", "Premium Display Format", options=["Total Dollars ($420)", "Contract Price ($4.20)", "Both ($4.20 | $420)"], group=grp_hud)
+hide_na      = input.bool(true, "Hide Unloaded / Zero-Volume Strikes", group=grp_hud)
+hud_pos      = input.string("Bottom Right", "Scanner HUD Position", options=["Top Right", "Middle Right", "Bottom Right", "Top Left", "Middle Left", "Bottom Left", "Top Center", "Bottom Center"], group=grp_hud)
+hud_size     = input.string("Large", "HUD Text Size", options=["Tiny", "Small", "Normal", "Large", "Huge"], group=grp_hud)
+
+col_chamber  = input.color(color.new(#00FF00, 10), "Chambered BG (In $400-$450 Zone)", inline="c1", group=grp_hud)
+txt_chamber  = input.color(color.new(#000000, 0), "Text", inline="c1", group=grp_hud)
+col_closest  = input.color(color.new(#FFD700, 10), "Closest Fallback BG (Gold)", inline="c2", group=grp_hud)
+txt_closest  = input.color(color.new(#000000, 0), "Text", inline="c2", group=grp_hud)
+col_ghost    = input.color(color.new(#0A0A0A, 25), "Out-of-Zone BG (Ghosted)", inline="c3", group=grp_hud)
+txt_ghost    = input.color(color.new(#707070, 0), "Text", inline="c3", group=grp_hud)
+col_header   = input.color(color.new(#111111, 10), "Header BG", inline="c4", group=grp_hud)
+txt_header   = input.color(color.new(#FFFFFF, 0), "Text", inline="c4", group=grp_hud)
+
+grp_alt = "4. Chamber Shift Alert"
+alt_shift    = input.bool(false, "Alert When New Strike Enters the Chamber", group=grp_alt)
+
+
+//══════════════════════════════════════════════════════════════════════════════
+// BLOCK 2: OPRA TICKER GENERATOR ENGINE (PURE SIMPLE TYPES)
+//══════════════════════════════════════════════════════════════════════════════
+string eff_root = custom_root != "" ? custom_root : opt_root
+
+f_format_strike(simple float s) =>
+    bool is_whole = s == math.floor(s)
+    string whole_str = str.tostring(math.round(s))
+    string dec_str   = str.tostring(s)
+    strk_format == "Auto (.0 for Whole Numbers)" ? (is_whole ? whole_str + ".0" : dec_str) : strk_format == "Integer Only (No .0)" ? (is_whole ? whole_str : dec_str) : dec_str
+
+f_build_sym(simple int idx) =>
+    float s_val = anchor_strk + ((idx - 17) * strk_step)
+    string s_str = f_format_strike(s_val)
+    opt_exch + ":" + eff_root + exp_code + "C" + s_str
+
+
+//══════════════════════════════════════════════════════════════════════════════
+// BLOCK 3: 35-CALL PARALLEL TELEMETRY ARRAY (request.security)
+//══════════════════════════════════════════════════════════════════════════════
+f_poll(simple int idx) =>
+    request.security(f_build_sym(idx), timeframe.period, close, ignore_invalid_symbol=true)
+
+float p00 = f_poll(0),  float p01 = f_poll(1),  float p02 = f_poll(2),  float p03 = f_poll(3),  float p04 = f_poll(4)
+float p05 = f_poll(5),  float p06 = f_poll(6),  float p07 = f_poll(7),  float p08 = f_poll(8),  float p09 = f_poll(9)
+float p10 = f_poll(10), float p11 = f_poll(11), float p12 = f_poll(12), float p13 = f_poll(13), float p14 = f_poll(14)
+float p15 = f_poll(15), float p16 = f_poll(16), float p17 = f_poll(17), float p18 = f_poll(18), float p19 = f_poll(19)
+float p20 = f_poll(20), float p21 = f_poll(21), float p22 = f_poll(22), float p23 = f_poll(23), float p24 = f_poll(24)
+float p25 = f_poll(25), float p26 = f_poll(26), float p27 = f_poll(27), float p28 = f_poll(28), float p29 = f_poll(29)
+float p30 = f_poll(30), float p31 = f_poll(31), float p32 = f_poll(32), float p33 = f_poll(33), float p34 = f_poll(34)
+
+
+//══════════════════════════════════════════════════════════════════════════════
+// BLOCK 4: CHAMBER CLASSIFICATION & BULLSEYE SOLVER
+//══════════════════════════════════════════════════════════════════════════════
+float[] prem_arr = array.new_float(35, na)
+array.set(prem_arr, 0,  p00), array.set(prem_arr, 1,  p01), array.set(prem_arr, 2,  p02), array.set(prem_arr, 3,  p03), array.set(prem_arr, 4,  p04)
+array.set(prem_arr, 5,  p05), array.set(prem_arr, 6,  p06), array.set(prem_arr, 7,  p07), array.set(prem_arr, 8,  p08), array.set(prem_arr, 9,  p09)
+array.set(prem_arr, 10, p10), array.set(prem_arr, 11, p11), array.set(prem_arr, 12, p12), array.set(prem_arr, 13, p13), array.set(prem_arr, 14, p14)
+array.set(prem_arr, 15, p15), array.set(prem_arr, 16, p16), array.set(prem_arr, 17, p17), array.set(prem_arr, 18, p18), array.set(prem_arr, 19, p19)
+array.set(prem_arr, 20, p20), array.set(prem_arr, 21, p21), array.set(prem_arr, 22, p22), array.set(prem_arr, 23, p23), array.set(prem_arr, 24, p24)
+array.set(prem_arr, 25, p25), array.set(prem_arr, 26, p26), array.set(prem_arr, 27, p27), array.set(prem_arr, 28, p28), array.set(prem_arr, 29, p29)
+array.set(prem_arr, 30, p30), array.set(prem_arr, 31, p31), array.set(prem_arr, 32, p32), array.set(prem_arr, 33, p33), array.set(prem_arr, 34, p34)
+
+int   best_idx      = -1
+float min_diff      = 999999.0
+bool  any_in_zone   = false
+int   valid_loaded  = 0
+
+for i = 0 to 34
+    float pr = array.get(prem_arr, i)
+    if not na(pr) and pr > 0
+        valid_loaded += 1
+        bool in_z = pr >= prem_floor and pr <= prem_ceil
+        if in_z
+            any_in_zone := true
+        float diff = math.abs(pr - prem_ideal)
+        if diff < min_diff
+            min_diff := diff
+            best_idx := i
+
+var float last_best_strike = na
+if best_idx != -1
+    float curr_best_s = anchor_strk + ((best_idx - 17) * strk_step)
+    if alt_shift and not na(last_best_strike) and curr_best_s != last_best_strike and barstate.isrealtime
+        alert("NXS SCANNER: Chamber Shifted to " + eff_root + " " + str.tostring(curr_best_s) + "C @ $" + str.tostring(array.get(prem_arr, best_idx), "#.00"), alert.freq_once_per_bar)
+    last_best_strike := curr_best_s
+
+
+//══════════════════════════════════════════════════════════════════════════════
+// BLOCK 5: MULTI-ORIENTATION OBSIDIAN HUD RENDERER
+//══════════════════════════════════════════════════════════════════════════════
+f_get_size(string s) =>
+    s == "Tiny" ? size.tiny : s == "Small" ? size.small : s == "Normal" ? size.normal : s == "Large" ? size.large : size.huge
+
+f_get_pos(string p) =>
+    p == "Top Right" ? position.top_right : p == "Middle Right" ? position.middle_right : p == "Bottom Right" ? position.bottom_right : p == "Top Left" ? position.top_left : p == "Middle Left" ? position.middle_left : p == "Bottom Left" ? position.bottom_left : p == "Top Center" ? position.top_center : position.bottom_center
+
+f_fmt_prem(float pr) =>
+    if price_fmt == "Total Dollars ($420)"
+        "$" + str.tostring(pr * 100, "#")
+    else if price_fmt == "Contract Price ($4.20)"
+        "$" + str.tostring(pr, "#.00")
+    else
+        "$" + str.tostring(pr, "#.00") + " ($" + str.tostring(pr * 100, "#") + ")"
+
+// 40x42 grid supports both vertical and horizontal layouts seamlessly
+var table hud = table.new(f_get_pos(hud_pos), 40, 42, border_width=1, border_color=color.new(#FFFFFF, 85))
+
+if barstate.islast
+    table.clear(hud, 0, 0, 39, 41)
+    string txt_sz = hud_size
+    string zone_str = "$" + str.tostring(prem_floor * 100, "#") + "-$" + str.tostring(prem_ceil * 100, "#")
+
+    if valid_loaded == 0
+        table.cell(hud, 0, 0, "NO CHAIN: " + eff_root + exp_code + "C" + str.tostring(anchor_strk), bgcolor=color.new(#8B0000, 20), text_color=color.white, text_size=f_get_size(txt_sz))
+    else
+        int center_i = best_idx != -1 ? best_idx : 17
+        int radius   = hud_mode == "Single Bullseye (1-Strike Only)" ? 0 : hud_mode == "Sniper Pill (3-Strike Compact)" ? 1 : hud_mode == "In-Zone Only ($400-$450 Filter)" ? 17 : ladder_rad
+        int start_i  = math.max(0, center_i - radius)
+        int end_i    = math.min(34, center_i + radius)
+
+        // ---------------------------------------------------------------------
+        // MODE 1: VERTICAL STACK (1-COLUMN ULTRA-SLIM STRIP)
+        // ---------------------------------------------------------------------
+        if hud_style == "Vertical Stack (1-Column Slim)"
+            int r_ptr = 0
+            if show_hdr
+                table.cell(hud, 0, r_ptr, eff_root + " [" + zone_str + "]", bgcolor=col_header, text_color=color.new(#00FF00, 0), text_size=f_get_size(txt_sz))
+                r_ptr += 1
+
+            for i = start_i to end_i
+                float pr    = array.get(prem_arr, i)
+                float s_val = anchor_strk + ((i - 17) * strk_step)
+                bool  valid = not na(pr) and pr > 0
+                bool  is_in_zone = valid and (pr >= prem_floor and pr <= prem_ceil)
+                bool  is_best    = (i == best_idx)
+
+                bool pass_filter = hud_mode == "In-Zone Only ($400-$450 Filter)" ? (is_in_zone or (not any_in_zone and is_best)) : (valid or not hide_na)
+
+                if pass_filter
+                    color row_bg  = is_in_zone ? col_chamber : (is_best and not any_in_zone ? col_closest : col_ghost)
+                    color row_txt = is_in_zone ? txt_chamber : (is_best and not any_in_zone ? txt_closest : txt_ghost)
+                    string p_txt  = valid ? f_fmt_prem(pr) : "N/A"
+                    string cell_s = str.tostring(s_val) + "C  |  " + p_txt
+
+                    table.cell(hud, 0, r_ptr, cell_s, bgcolor=row_bg, text_color=row_txt, text_size=f_get_size(txt_sz))
+                    r_ptr += 1
+
+        // ---------------------------------------------------------------------
+        // MODE 2: HORIZONTAL TAPE (SINGLE-ROW TOP/BOTTOM BAR)
+        // ---------------------------------------------------------------------
+        else if hud_style == "Horizontal Tape (Bottom/Top Bar)"
+            int c_ptr = 0
+            if show_hdr
+                table.cell(hud, c_ptr, 0, eff_root + "\n" + zone_str, bgcolor=col_header, text_color=color.new(#00FF00, 0), text_size=f_get_size(txt_sz))
+                c_ptr += 1
+
+            for i = start_i to end_i
+                float pr    = array.get(prem_arr, i)
+                float s_val = anchor_strk + ((i - 17) * strk_step)
+                bool  valid = not na(pr) and pr > 0
+                bool  is_in_zone = valid and (pr >= prem_floor and pr <= prem_ceil)
+                bool  is_best    = (i == best_idx)
+
+                bool pass_filter = hud_mode == "In-Zone Only ($400-$450 Filter)" ? (is_in_zone or (not any_in_zone and is_best)) : (valid or not hide_na)
+
+                if pass_filter
+                    color cell_bg  = is_in_zone ? col_chamber : (is_best and not any_in_zone ? col_closest : col_ghost)
+                    color cell_txt = is_in_zone ? txt_chamber : (is_best and not any_in_zone ? txt_closest : txt_ghost)
+                    string p_txt   = valid ? f_fmt_prem(pr) : "N/A"
+                    string cell_s  = str.tostring(s_val) + "C\n" + p_txt
+
+                    table.cell(hud, c_ptr, 0, cell_s, bgcolor=cell_bg, text_color=cell_txt, text_size=f_get_size(txt_sz))
+                    c_ptr += 1
+
+        // ---------------------------------------------------------------------
+        // MODE 3: CLASSIC 3-COLUMN TABLE
+        // ---------------------------------------------------------------------
+        else
+            int row_ptr = 0
+            if show_hdr
+                string mode_tag = hud_mode == "Single Bullseye (1-Strike Only)" ? "BULLSEYE" : hud_mode == "In-Zone Only ($400-$450 Filter)" ? "IN-ZONE" : hud_mode == "Sniper Pill (3-Strike Compact)" ? "SNIPER PILL" : "CHAMBER LADDER"
+                table.cell(hud, 0, 0, "NXS " + eff_root + " (" + exp_code + ")", bgcolor=col_header, text_color=txt_header, text_size=f_get_size(txt_sz))
+                table.cell(hud, 1, 0, "TARGET: " + zone_str, bgcolor=col_header, text_color=color.new(#00FF00, 0), text_size=f_get_size(txt_sz))
+                table.cell(hud, 2, 0, mode_tag, bgcolor=col_header, text_color=txt_header, text_size=f_get_size(txt_sz))
+                table.cell(hud, 0, 1, "CONTRACT", bgcolor=col_header, text_color=color.new(#AAAAAA, 0), text_size=f_get_size(txt_sz))
+                table.cell(hud, 1, 1, "PREMIUM", bgcolor=col_header, text_color=color.new(#AAAAAA, 0), text_size=f_get_size(txt_sz))
+                table.cell(hud, 2, 1, "STATUS", bgcolor=col_header, text_color=color.new(#AAAAAA, 0), text_size=f_get_size(txt_sz))
+                row_ptr := 2
+
+            for i = start_i to end_i
+                float pr    = array.get(prem_arr, i)
+                float s_val = anchor_strk + ((i - 17) * strk_step)
+                bool  valid = not na(pr) and pr > 0
+                bool  is_in_zone = valid and (pr >= prem_floor and pr <= prem_ceil)
+                bool  is_best    = (i == best_idx)
+
+                bool pass_filter = hud_mode == "In-Zone Only ($400-$450 Filter)" ? (is_in_zone or (not any_in_zone and is_best)) : (valid or not hide_na)
+
+                if pass_filter
+                    color row_bg  = col_ghost
+                    color row_txt = txt_ghost
+                    string status_lbl = "-"
+
+                    if is_in_zone
+                        row_bg     := col_chamber
+                        row_txt    := txt_chamber
+                        status_lbl := is_best ? "CHAMBERED" : "IN ZONE"
+                    else if is_best and not any_in_zone
+                        row_bg     := col_closest
+                        row_txt    := txt_closest
+                        status_lbl := "CLOSEST"
+                    else if valid
+                        float diff_dlr = (pr - prem_ideal) * 100
+                        string sign_s  = diff_dlr > 0 ? "+" : ""
+                        status_lbl     := sign_s + "$" + str.tostring(diff_dlr, "#")
+
+                    string strk_lbl = eff_root + " " + str.tostring(s_val) + " C"
+                    string prem_lbl = valid ? f_fmt_prem(pr) : "N/A"
+
+                    table.cell(hud, 0, row_ptr, strk_lbl, bgcolor=row_bg, text_color=row_txt, text_size=f_get_size(txt_sz))
+                    table.cell(hud, 1, row_ptr, prem_lbl, bgcolor=row_bg, text_color=row_txt, text_size=f_get_size(txt_sz))
+                    table.cell(hud, 2, row_ptr, status_lbl, bgcolor=row_bg, text_color=row_txt, text_size=f_get_size(txt_sz))
+                    row_ptr += 1
